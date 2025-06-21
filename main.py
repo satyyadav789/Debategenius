@@ -2,110 +2,86 @@ import os
 import time
 import asyncio
 import requests
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes,
-    CommandHandler, MessageHandler, filters
-)
-from dotenv import load_dotenv
 import nest_asyncio
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+from dotenv import load_dotenv
 
-# Load environment variables
+# Load .env
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
-# In-memory session state
-user_state = {}
+# Memory and debate mode
+memory = {}
+debate_mode = {}
 
-# Debate mode toggle
-def is_debate_mode(chat_id):
-    return user_state.get(chat_id, {}).get("debate", False)
-
-def set_debate_mode(chat_id, value: bool):
-    user_state.setdefault(chat_id, {})["debate"] = value
-
-# GPT-4-Vision (text only mode here)
-async def query_openrouter_gpt(prompt: str):
+# OpenRouter (GPT-4 Vision) API call
+def call_openrouter(prompt, image_base64=None):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": "openrouter/gpt-4-vision-preview",
-        "messages": [
-            {"role": "system", "content": "You are a helpful and intelligent assistant."},
-            {"role": "user", "content": prompt}
-        ]
+    data = {
+        "model": "openai/gpt-4-vision-preview",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+        "temperature": 0.7
     }
+    response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
+    return response.json()["choices"][0]["message"]["content"]
 
-    start = time.time()
-    response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-    latency = time.time() - start
-    print(f"[INFO] Response time: {latency:.2f} seconds")
+# Web search via Serper
+def web_search(query):
+    headers = {"X-API-KEY": SERPER_API_KEY}
+    json_data = {"q": query}
+    response = requests.post("https://google.serper.dev/search", headers=headers, json=json_data)
+    result = response.json()
+    if "organic" in result:
+        return result["organic"][0]["snippet"]
+    return "No search results found."
 
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
-        print("OpenRouter Error:", response.status_code, response.text)
-        return "Sorry, I couldn't reach the AI."
+# Command to toggle debate mode
+async def debate_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    debate_mode[user_id] = not debate_mode.get(user_id, False)
+    status = "activated" if debate_mode[user_id] else "deactivated"
+    await update.message.reply_text(f"Debate mode {status}.")
 
-# Serper Web Search
-async def web_search(query: str):
-    headers = {
-        "X-API-KEY": SERPER_API_KEY,
-        "Content-Type": "application/json"
-    }
-    data = {"q": query}
-    response = requests.post("https://google.serper.dev/search", headers=headers, json=data)
-
-    if response.status_code == 200:
-        results = response.json().get("organic", [])
-        output = "\n\n".join([f"{r['title']}\n{r['link']}" for r in results[:3]])
-        return output or "No results found."
-    else:
-        print("Serper API Error:", response.status_code, response.text)
-        return "Web search failed."
-
-# Main reply logic
+# Handle user messages
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_input = update.message.text
-    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    text = update.message.text
+    memory.setdefault(user_id, []).append({"user": text})
 
-    if user_input.lower().startswith("search "):
-        query = user_input[7:]
-        result = await web_search(query)
+    if debate_mode.get(user_id, False):
+        text = f"Debate this statement logically and persuasively: {text}"
+
+    # Optional: Add search if keyword present
+    if "search:" in text.lower():
+        query = text.split("search:", 1)[1].strip()
+        result = web_search(query)
         await update.message.reply_text(result)
         return
 
-    prompt = user_input
-    if is_debate_mode(chat_id):
-        prompt = f"You are in debate mode. Argue your point clearly and logically.\nDebate this: {user_input}"
+    start = time.time()
+    reply = call_openrouter(text)
+    end = time.time()
 
-    reply = await query_openrouter_gpt(prompt)
-    await update.message.reply_text(reply)
+    memory[user_id].append({"bot": reply})
+    await update.message.reply_text(f"{reply}\n\n🕒 Response time: {round(end - start, 2)}s")
 
-# Command handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! I'm your AI bot. Use /debate to toggle debate mode. Type 'search <topic>' to search the web.")
-
-async def toggle_debate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    current = is_debate_mode(chat_id)
-    set_debate_mode(chat_id, not current)
-    await update.message.reply_text(f"Debate mode is now {'ON' if not current else 'OFF'}.")
-
-# App start
+# Main function
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("debate", toggle_debate))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("debate", debate_toggle))
+
     print("Bot is running...")
     await app.run_polling()
 
+# Entry point
 if __name__ == "__main__":
     nest_asyncio.apply()
     asyncio.run(main())
